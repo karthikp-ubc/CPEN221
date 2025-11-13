@@ -2,26 +2,26 @@
 
 import java.util.Arrays;
 import java.util.Random; 
-import java.RecursiveTask;
+import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.ForkJoinPool;
 
-class SumArray extends RecursiveTask<Integer> {
+class SumArray extends RecursiveTask<Long> {
     // Uses a thread pool instead of individual threads
 
     int lo; int hi; int[] arr; // arguments
     long ans = 0; // result
     public static long sequentialCutoff = 10000;
-    public static boolean separateThreads = false;
 
-    SumThread(int[] a, int l, int h) { 
+    SumArray(int[] a, int l, int h) { 
         arr = a;
         lo = l;
         hi = h;
     }
     
-    protected Integer compute(){ // function to override
+    protected Long compute(){ // function to override
         
-        if(hi – lo < sequentialCutoff) {
-            int ans = 0;
+        if(hi - lo < sequentialCutoff) {
+            long ans = 0;
             for(int i=lo; i < hi; i++)
                 ans += arr[i];
             return ans;
@@ -29,26 +29,22 @@ class SumArray extends RecursiveTask<Integer> {
             SumArray left = new SumArray(arr,lo,(hi+lo)/2);
             SumArray right= new SumArray(arr,(hi+lo)/2,hi);
             left.fork();
-            int rightAns = right.compute();
-            int leftAns  = left.join();
+            long rightAns = right.compute();
+            long leftAns  = left.join();
             return leftAns + rightAns;
         }
     }
 }
 
-static final ForkJoinPool fjPool = new ForkJoinPool();
-    int sum(int[] arr) {
-        return ForkJoinPool.commonPool().invoke
-            (new SumArray(arr,0,arr.length));
-}
 
-public class ArraySum {
+public class ArraySum2 {
 
+    static final ForkJoinPool fjPool = new ForkJoinPool();
+    
     static long parallelSum(int[] arr) {
         // Parallel sum of the array arr
-        SumThread t = new SumThread(arr,0,arr.length);
-        t.run();
-        return t.ans;
+        return ForkJoinPool.commonPool().invoke
+            (new SumArray(arr, 0,arr.length));
     }
 
     static long sequentialSum(int[] arr) {
@@ -67,7 +63,7 @@ public class ArraySum {
    
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.out.println("Syntax: array_length num_trials <separate_threads> <sequential_cutoff>");
+            System.out.println("Syntax: array_length num_trials <sequential_cutoff>");
             System.exit(0);
         }
 
@@ -84,9 +80,6 @@ public class ArraySum {
 
         // Set the parameters for the parallel sum class if the arguments are specified
         if (args.length>2)
-            SumThread.separateThreads = Boolean.parseBoolean(args[2]);
-
-        if (args.length>3)
             SumThread.sequentialCutoff = 10000;
         
         // Compute the sum in parallel multiple times and average the duration
