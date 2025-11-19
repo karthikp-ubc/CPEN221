@@ -20,7 +20,6 @@ public class FineGrainedConcurrentHashTable<K, V> {
         this(DEFAULT_CAPACITY);
     }
 
-    @SuppressWarnings("unchecked")
     public FineGrainedConcurrentHashTable(int capacity) {
         this.capacity = capacity;
         this.buckets = (Bucket<K, V>[]) new Bucket[capacity];
