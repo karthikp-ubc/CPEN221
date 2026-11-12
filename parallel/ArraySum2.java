@@ -61,9 +61,16 @@ public class ArraySum2 {
         }
     }
    
+    static double median(double[] xs) {
+        double[] s = xs.clone();
+        Arrays.sort(s);
+        int n = s.length;
+        return (n % 2 == 1) ? s[n/2] : (s[n/2 - 1] + s[n/2]) / 2;
+    }
+
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.out.println("Syntax: array_length num_trials <sequential_cutoff>");
+            System.out.println("Syntax: array_length num_trials <sequential_cutoff> <warmup_runs>");
             System.exit(0);
         }
 
@@ -80,33 +87,43 @@ public class ArraySum2 {
 
         // Set the parameters for the parallel sum class if the arguments are specified
         if (args.length>2)
-            SumThread.sequentialCutoff = 10000;
-        
-        // Compute the sum in parallel multiple times and average the duration
-        double parallelDuration = 0.0;    
+            SumArray.sequentialCutoff = Long.parseLong(args[2]);
+
+        int warmup = (args.length>3) ? Integer.parseInt(args[3]) : 0;
+
+        // Warm-up runs are discarded: they let the JIT compile the hot code first
+        for (int i=0; i<warmup; ++i) {
+            parallelSum(arr);
+            sequentialSum(arr);
+        }
+
+        // Compute the sum in parallel multiple times and take the median duration
+        double[] parallelDurations = new double[numTrials];
         for (int i=0; i<numTrials; ++i) {
             long startTime = System.nanoTime();
             ps = parallelSum(arr);
             long endTime = System.nanoTime();
-            double duration = (endTime - startTime)/1000000;
-            parallelDuration += (duration / numTrials);
+            parallelDurations[i] = (endTime - startTime) / 1e6;
         }
 
-        // Compute the sum sequentially multiple times and average the duration
-        double sequentialDuration = 0.0;    
+        // Compute the sum sequentially multiple times and take the median duration
+        double[] sequentialDurations = new double[numTrials];
         for (int i=0; i<numTrials; ++i) {
             long startTime = System.nanoTime();
             ss = sequentialSum(arr);
             long endTime = System.nanoTime();
-            double duration = (endTime - startTime)/1000000;
-            sequentialDuration += (duration / numTrials);
+            sequentialDurations[i] = (endTime - startTime) / 1e6;
         }
-        
+
         // Print the statistics for sequential and parallel duration
         System.out.println("Parallel sum = " +  ps);
         System.out.println("Sequential sum = " + ss);
-        System.out.println("Average sequential Duration (ms) = " + sequentialDuration);
-        System.out.println("Average parallel Duration (ms) = " + parallelDuration);
+        System.out.println("Median sequential Duration (ms) = " + median(sequentialDurations));
+        System.out.println("Median parallel Duration (ms) = " + median(parallelDurations));
+        if (ps != ss) {
+            System.out.println("WRONG ANSWER: parallel and sequential sums differ");
+            System.exit(2);
+        }
     }
 
 }
