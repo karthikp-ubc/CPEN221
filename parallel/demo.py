@@ -22,9 +22,8 @@ BUILD, RESULTS, FIGURES = HERE / "build", HERE / "results", HERE / "figures"
 NPROC = os.cpu_count() or 1
 PROGRAMS = ["SumThread", "ArraySum", "ArraySum2"]
 
-# SumThread.sum() computes i * len / numThreads in int arithmetic, which overflows
-# once (numThreads-1) * len > 2^31-1. 8M is the largest round size safe for 256.
-SUMTHREAD_N = 8_000_000
+# Fixed array size for the SumThread thread-count sweep.
+SUMTHREAD_N = 10_000_000
 
 PRESETS = {
     "quick": dict(

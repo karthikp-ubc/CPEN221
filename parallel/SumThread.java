@@ -56,7 +56,8 @@ public class SumThread extends Thread {
 		int numThreads = numTs;
 		SumThread[] ts = new SumThread[numThreads];
 		for (int i = 0; i < numThreads; i++) {// do parallel computations
-			ts[i] = new SumThread(arr, i * len / numThreads, (i + 1) * len / numThreads);
+			ts[i] = new SumThread(arr, (int) ((long) i * len / numThreads),
+					(int) ((long) (i + 1) * len / numThreads));
 			ts[i].start(); // start not run
 		}
 		for (int i = 0; i < numThreads; i++) { // combine results
