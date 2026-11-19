@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Benchmark driver behind demo.sh. Standard library + matplotlib only.
 
-Every data point is one fresh JVM that does `warmup` discarded runs, then
-`trials` timed runs, and prints the median (see each program's main()).
-Rows are printed as they finish, appended to results/<Program>.csv, and
-plots are drawn from the CSV (latest run of each experiment).
+Every data point does `warmup` discarded runs, then `trials` timed runs, and
+reports the median (see each program's main()). Most programs use one fresh
+JVM per point; HashTablePerformanceTest uses one JVM per bucket count so the
+table is built once and reused across thread counts. Rows are printed as they
+finish, appended to results/<Program>.csv, and plots are drawn from the CSV
+(latest run of each experiment).
 """
 import argparse
 import csv
@@ -14,13 +16,23 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BUILD, RESULTS, FIGURES = HERE / "build", HERE / "results", HERE / "figures"
 NPROC = os.cpu_count() or 1
-PROGRAMS = ["SumThread", "ArraySum", "ArraySum2"]
+FORKJOIN = ["SumThread", "ArraySum", "ArraySum2"]          # the `all` overlay
+BENCHMARKS = FORKJOIN + ["HashTablePerformanceTest", "AtomicMutexBenchmark"]
+TESTS = ["ConcurrentHashTableTest"]                        # pass/fail only, run with -ea
+PROGRAMS = BENCHMARKS + TESTS
+DEPS = {  # extra sources compiled alongside a program, into its own build dir
+    "HashTablePerformanceTest": ["FineGrainedConcurrentHashTable"],
+    "ConcurrentHashTableTest": ["FineGrainedConcurrentHashTable"],
+    "AtomicMutexBenchmark": ["AtomicMutex"],
+}
 
 # Fixed array size for the SumThread thread-count sweep.
 SUMTHREAD_N = 10_000_000
@@ -36,6 +48,16 @@ PRESETS = {
         par_n=10**7,
         parallelism=list(range(1, NPROC + 1)),
         dpi=150,
+        # Per-program overrides (merged over the keys above by cfg_for()).
+        HashTablePerformanceTest=dict(
+            warmup=3, trials=7, timeout=120,   # timeout covers one JVM = one bucket count
+            buckets=[1, 4, 16, 64, 256], threads=[1, 4, 16],
+            table_size=20_000, ops=2_000,
+        ),
+        AtomicMutexBenchmark=dict(
+            warmup=1, trials=5, timeout=60,    # sleep-bound: JIT warm-up barely matters
+            threads=[1, 2, 4, 8, 16, 32], iterations=6,
+        ),
     ),
     "full": dict(
         warmup=5, trials=15, timeout=300,
@@ -47,11 +69,31 @@ PRESETS = {
         par_n=10**8,
         parallelism=list(range(1, NPROC + 1)),
         dpi=300,
+        # The sweeps on the slides. Roughly 20-30 min each.
+        HashTablePerformanceTest=dict(
+            warmup=5, trials=15, timeout=3600,
+            buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256], threads=[1, 2, 4, 8, 16],
+            table_size=100_000, ops=10_000,
+        ),
+        AtomicMutexBenchmark=dict(
+            warmup=2, trials=9, timeout=1200,  # 64 threads x 100 iterations ~ 40 s per run
+            threads=[1, 2, 4, 8, 16, 32, 64], iterations=100,
+        ),
     ),
 }
 
+
+def cfg_for(prog, preset):
+    cfg = {k: v for k, v in PRESETS[preset].items() if k not in PROGRAMS}
+    cfg.update(PRESETS[preset].get(prog, {}))
+    return cfg
+
+
+# n is the problem size: array length (fork-join), table entries (hashtable),
+# or lock acquisitions per thread (mutex).
 FIELDS = ["run_id", "timestamp", "preset", "experiment", "mode", "n", "threads",
-          "cutoff", "parallelism", "warmup", "trials", "median_ms", "status", "note"]
+          "cutoff", "parallelism", "buckets", "warmup", "trials", "median_ms", "status",
+          "note"]
 
 # ---------------------------------------------------------------- formatting
 
@@ -91,20 +133,22 @@ class Table:
 def compile_program(prog):
     """Each program gets its own output dir: SumThread.java and ArraySum.java
     both declare class SumThread, so they cannot share a directory."""
-    src, out = HERE / f"{prog}.java", BUILD / prog
+    srcs = [HERE / f"{p}.java" for p in [prog, *DEPS.get(prog, [])]]
+    out = BUILD / prog
     cls = out / f"{prog}.class"
-    if cls.exists() and cls.stat().st_mtime >= src.stat().st_mtime:
+    if cls.exists() and all(cls.stat().st_mtime >= s.stat().st_mtime for s in srcs):
         print(f"[build] {prog}: up to date ({out.relative_to(HERE)}/)")
         return
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("*.class"):
         old.unlink()
-    print(f"[build] {prog}: javac {src.name} -> {out.relative_to(HERE)}/", flush=True)
+    names = " ".join(s.name for s in srcs)
+    print(f"[build] {prog}: javac {names} -> {out.relative_to(HERE)}/", flush=True)
     # empty -sourcepath: never pull in a sibling file's SumThread
-    r = subprocess.run(["javac", "-nowarn", "-sourcepath", "", "-d", str(out), str(src)],
+    r = subprocess.run(["javac", "-nowarn", "-sourcepath", "", "-d", str(out), *map(str, srcs)],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        sys.exit(f"compile failed for {src.name}:\n{r.stderr}")
+        sys.exit(f"compile failed for {names}:\n{r.stderr}")
 
 # -------------------------------------------------------------------- running
 
@@ -133,6 +177,37 @@ def run_java(prog, args, timeout, jvm_flags=()):
     return "ok", out, note
 
 
+def run_java_stream(prog, args, timeout, on_line, jvm_flags=()):
+    """Like run_java, but calls on_line(line) for each stdout line as it arrives."""
+    cmd = ["java", *jvm_flags, "-cp", str(BUILD / prog), prog, *map(str, args)]
+    with tempfile.TemporaryFile("w+") as err:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True, bufsize=1,
+                             start_new_session=True)
+        expired = threading.Event()
+
+        def kill():
+            expired.set()
+            os.killpg(p.pid, signal.SIGKILL)
+        timer = threading.Timer(timeout, kill)
+        timer.start()
+        out = []
+        try:
+            for line in p.stdout:
+                out.append(line)
+                on_line(line.rstrip("\n"))
+            p.wait()
+        finally:
+            timer.cancel()
+        err.seek(0)
+        errtext = err.read()
+    if expired.is_set():
+        return "timeout", "".join(out), f"no result within {timeout}s"
+    if p.returncode != 0 or "Exception" in errtext:
+        last = (errtext.strip().splitlines() or ["?"])[-1][:80]
+        return "error", "".join(out), f"exit {p.returncode}: {last}"
+    return "ok", "".join(out), ""
+
+
 def grab(pattern, text):
     m = re.search(pattern, text)
     return float(m.group(1)) if m else None
@@ -144,7 +219,13 @@ class Recorder:
         self.run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.preset, self.cfg = preset, cfg
         RESULTS.mkdir(exist_ok=True)
-        if not self.path.exists():
+        if self.path.exists():
+            # Append in the file's own column order: CSVs written before a column
+            # was added keep their header, and rows never shift under it.
+            with self.path.open(newline="") as f:
+                self.header = next(csv.reader(f), FIELDS)
+        else:
+            self.header = FIELDS
             with self.path.open("w", newline="") as f:
                 csv.writer(f).writerow(FIELDS)
 
@@ -154,9 +235,13 @@ class Recorder:
                    warmup=self.cfg["warmup"], trials=self.cfg["trials"],
                    median_ms="" if median is None else f"{median:.6f}",
                    status=status, note=note)
-        row.update({k: params.get(k, "") for k in ("n", "threads", "cutoff", "parallelism")})
+        row.update({k: params.get(k, "") for k in ("n", "threads", "cutoff", "parallelism",
+                                                   "buckets")})
+        lost = [k for k, v in row.items() if v != "" and k not in self.header]
+        if lost:
+            sys.exit(f"demo: {self.path.name} has no column for {lost}; move it aside to start fresh")
         with self.path.open("a", newline="") as f:  # append + close per row: survives Ctrl-C
-            csv.DictWriter(f, FIELDS).writerow(row)
+            csv.DictWriter(f, self.header, extrasaction="ignore").writerow(row)
 
 
 def status_cell(status, note):
@@ -276,6 +361,85 @@ def bench_arraysum2(rec, cfg, show):
                 n=n, cutoff=10000, parallelism=k)
     plot_program("ArraySum2", cfg, show, only="parallelism")
 
+
+def bench_hashtable(rec, cfg, show):
+    """One JVM per bucket count: the table is built once (untimed) and reused for
+    every thread count; timed get/put ops only touch existing keys."""
+    size, ops, to = cfg["table_size"], cfg["ops"], cfg["timeout"]
+    w, t = cfg["warmup"], cfg["trials"]
+    threads = ",".join(map(str, cfg["threads"]))
+    tab = Table(f"HashTablePerformanceTest: time vs buckets, {si(size)} entries, "
+                f"{si(ops)} ops/thread (50% get, 50% put)  (timeout {to}s per bucket count)",
+                [("buckets", 7), ("threads", 7), ("median ms", 10), ("kops/s", 9), ("", 0)])
+    row_re = re.compile(r"^(\d+)\s+(\d+)\s+([\d.]+)\s*$")
+    note = f"ops/thread={ops}"
+    for b in cfg["buckets"]:
+        seen = set()
+
+        def on_line(line, b=b, seen=seen):
+            if line.startswith("# built"):
+                print(f"  ({line[2:]})", flush=True)
+                return
+            m = row_re.match(line)
+            if not m:
+                return
+            k, med = int(m.group(2)), float(m.group(3))
+            seen.add(k)
+            tab.start(b, k)
+            tab.finish(ms(med), f"{k * ops / med:,.0f}", "")
+            rec.add("buckets", "hashtable", med, "ok", note, n=size, threads=k, buckets=b)
+
+        status, _, why = run_java_stream("HashTablePerformanceTest",
+                                         [b, threads, size, ops, w, t], to, on_line)
+        for k in cfg["threads"]:  # thread counts that never reported
+            if k not in seen:
+                tab.start(b, k)
+                tab.finish("", "", status_cell(status if status != "ok" else "error",
+                                               why or "no output"))
+                rec.add("buckets", "hashtable", None, status if status != "ok" else "error",
+                        why or "no output", n=size, threads=k, buckets=b)
+    plot_program("HashTablePerformanceTest", cfg, show)
+
+
+def expected_sleep(iters, k):
+    """Expected time if locking cost nothing: each thread sleeps U{0..10} ms
+    outside and inside the lock (mean 5 ms each), and the in-lock sleeps of all
+    k threads can only happen one at a time."""
+    return max(iters * 10.0, k * iters * 5.0)
+
+
+def bench_mutex(rec, cfg, show):
+    iters, to, w, t = cfg["iterations"], cfg["timeout"], cfg["warmup"], cfg["trials"]
+    modes = [("spin", "false"), ("spin+onSpinWait", "true")]
+    tab = Table(f"AtomicMutexBenchmark: time vs threads, {iters} lock acquisitions per thread "
+                f"(nproc = {NPROC})",
+                [("threads", 7), ("mode", 15), ("median ms", 10), ("expected sleep", 14),
+                 ("vs sleep", 8), ("", 0)])
+    for k in cfg["threads"]:
+        for mode, flag in modes:  # interleaved so drift hits both modes equally
+            tab.start(k, mode)
+            status, out, note = run_java("AtomicMutexBenchmark", [k, iters, w, t], to,
+                                         [f"-Dmutex.backoff={flag}"])
+            med = grab(rf"(?m)^{k}\s+([\d.]+)\s*$", out) if status == "ok" else None
+            floor = expected_sleep(iters, k)
+            tab.finish(ms(med), ms(floor), f"{med / floor - 1:+.0%}" if med else "",
+                       status_cell(status, note))
+            rec.add("threads", mode, med, status, note, n=iters, threads=k)
+    plot_program("AtomicMutexBenchmark", cfg, show)
+
+
+def run_tests(prog):
+    """Runs a test driver with assertions enabled; prints PASS/FAIL."""
+    print(f"\n== {prog}: java -ea (assertions enabled)")
+    status, out, note = run_java(prog, [], 120, ["-ea"])
+    for line in out.splitlines():
+        print(f"  | {line}")
+    failed = status != "ok" or re.search(r"\bfail", out, re.I)
+    if failed:
+        print(f"\nFAIL  {status_cell(status, note) or 'a test reported failure'}")
+        sys.exit(1)
+    print("\nPASS  (all assertions held; exit status 0)")
+
 # ------------------------------------------------------------------- plotting
 
 # Validated categorical palette (fixed order), light surface.
@@ -288,7 +452,17 @@ STYLE = {  # mode -> (color, marker, label). Color follows the mode in every fig
     "separate-threads": (C["aqua"], "^", "Threads: right.start()"),
     "fork-join":        (C["violet"], "D", "Fork-join pool"),
     "SumThread":        (C["magenta"], "o", "SumThread (fixed split)"),
+    "spin":             (C["blue"], "o", "spin"),
+    "spin+onSpinWait":  (C["orange"], "s", "spin + Thread.onSpinWait()"),
 }
+# Ordinal blue ramp (light -> dark) for "one series per thread count".
+RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab",
+        "#184f95", "#104281", "#0d366b"]
+MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
+
+
+def ramp(n):
+    return [RAMP[round(i * (len(RAMP) - 1) / max(n - 1, 1))] for i in range(n)]
 
 
 def mpl():
@@ -326,21 +500,26 @@ def latest(rows, experiment):
     return [r for r in rows if r["run_id"] == rid]
 
 
-def series(rows, mode, xkey):
-    pts = sorted((float(r[xkey]), r) for r in rows if r["mode"] == mode)
+def series(rows, mode, xkey, keep=None):
+    keep = keep or (lambda r: r["mode"] == mode)
+    pts = sorted(((float(r[xkey]), r) for r in rows if keep(r)), key=lambda p: p[0])
     ok = [(x, float(r["median_ms"])) for x, r in pts if r["status"] == "ok" and r["median_ms"]]
     bad = [(x, r["status"]) for x, r in pts if r["status"] in ("timeout", "skipped", "wrong", "error")]
     return ok, bad
 
 
-def draw(ax, rows, modes, xkey):
-    """Line per mode; failed points shown as an X pinned to the top edge."""
+def draw(ax, rows, modes, xkey, styles=None):
+    """Line per mode; failed points shown as an X pinned to the top edge.
+    `styles` overrides STYLE as {mode: (color, marker, label, keep_fn)}."""
     import matplotlib.transforms as mt
     top = mt.blended_transform_factory(ax.transData, ax.transAxes)
     drew_fail = False
     for i, mode in enumerate(modes):
-        ok, bad = series(rows, mode, xkey)
-        color, marker, label = STYLE[mode]
+        if styles:
+            color, marker, label, keep = styles[mode]
+        else:
+            (color, marker, label), keep = STYLE[mode], None
+        ok, bad = series(rows, mode, xkey, keep)
         if ok:
             xs, ys = zip(*ok)
             ax.plot(xs, ys, color=color, marker=marker, label=label,
@@ -368,11 +547,11 @@ def plain_log(*axes):
         a.set_minor_formatter(NullFormatter())
 
 
-def footer(fig, rows, extra=""):
+def footer(fig, rows, extra="", jvm="one JVM per point"):
     r = rows[0]
     fig.text(0.01, -0.01,
              f"Median of {r['trials']} timed runs after {r['warmup']} discarded warm-up runs"
-             f" · one JVM per point · {NPROC} logical CPUs · run {r['run_id']}"
+             f" · {jvm} · {NPROC} logical CPUs · run {r['run_id']}"
              f" ({r['preset']}){extra}", fontsize=8, color=INK2, ha="left", va="top")
 
 
@@ -479,6 +658,48 @@ def plot_program(prog, cfg, show, only=None):
             footer(fig, rs, timeout_note(failed))
             out.append(save(fig, "ArraySum2_parallelism", cfg, plt))
 
+    if prog == "HashTablePerformanceTest" and want("buckets"):
+        rs = latest(rows, "buckets")
+        if rs:
+            ks = sorted({int(r["threads"]) for r in rs})
+            styles = {k: (c, MARKERS[i % len(MARKERS)], f"{k} thread{'s' * (k > 1)}",
+                          lambda r, k=k: int(r["threads"]) == k)
+                      for i, (k, c) in enumerate(zip(ks, ramp(len(ks))))}
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            failed = draw(ax, rs, ks, "buckets", styles)
+            ax.set_xscale("log", base=2); ax.set_yscale("log"); plain_log(ax.yaxis)
+            bs = sorted({int(r["buckets"]) for r in rs})
+            ax.set_xticks(bs, [str(b) for b in bs])
+            ax.set_xlabel("number of buckets (one lock per bucket)")
+            ax.set_ylabel("median time (ms, log scale)")
+            ops = re.search(r"ops/thread=(\d+)", rs[0]["note"])
+            per = f", {si(ops.group(1))} ops/thread" if ops else ""
+            ax.set_title(f"FineGrainedConcurrentHashTable: {si(rs[0]['n'])} entries{per}")
+            ax.legend(loc="upper right")
+            footer(fig, rs, timeout_note(failed), jvm="table built once per bucket count")
+            out.append(save(fig, "HashTablePerformanceTest_buckets", cfg, plt))
+
+    if prog == "AtomicMutexBenchmark" and want("threads"):
+        rs = latest(rows, "threads")
+        if rs:
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            failed = draw(ax, rs, ["spin", "spin+onSpinWait"], "threads")
+            ks = sorted({int(r["threads"]) for r in rs})
+            iters = int(rs[0]["n"])
+            ax.plot(ks, [expected_sleep(iters, k) for k in ks], color=INK2, linestyle="--",
+                    linewidth=1.5, label="expected sleep time if locking were free")
+            ax.set_xscale("log", base=2); ax.set_yscale("log"); plain_log(ax.yaxis)
+            ax.set_xticks(ks, [str(k) for k in ks])
+            ax.axvline(NPROC, color=INK2, linestyle=":", linewidth=1)
+            ax.text(NPROC * 1.06, 0.05, f"{NPROC} logical CPUs",
+                    transform=ax.get_xaxis_transform(), color=INK2, fontsize=9)
+            ax.set_xlabel("number of threads")
+            ax.set_ylabel("median time (ms, log scale)")
+            ax.set_title(f"AtomicMutex: {iters} lock acquisitions per thread")
+            ax.legend(loc="upper left")
+            footer(fig, rs, timeout_note(failed))
+            out.append(save(fig, "AtomicMutexBenchmark_threads", cfg, plt))
+
     if show:
         for p in out:
             open_file(p)
@@ -486,7 +707,7 @@ def plot_program(prog, cfg, show, only=None):
 
 
 def plot_all(cfg, show):
-    data = {p: read_csv(p) for p in PROGRAMS}
+    data = {p: read_csv(p) for p in FORKJOIN}
     missing = [f"results/{p}.csv (run ./demo.sh {p}.java)" for p, d in data.items() if not d]
     if missing:
         print("demo: cannot build the overlay; missing:\n  " + "\n  ".join(missing))
@@ -551,12 +772,16 @@ def main():
     a = ap.parse_args()
 
     preset = "full" if a.full else "quick"
-    cfg, show = PRESETS[preset], not a.no_show
     prog = a.program.removesuffix(".java")
+    cfg, show = cfg_for(prog, preset), not a.no_show
     t0 = time.monotonic()
 
     if prog == "all":
         plot_all(cfg, show)
+        return
+    if prog in TESTS:
+        compile_program(prog)
+        run_tests(prog)
         return
     if a.plot_only:
         if not read_csv(prog):
@@ -566,13 +791,15 @@ def main():
 
     jv = subprocess.run(["java", "-version"], capture_output=True, text=True).stderr.splitlines()[0]
     print(f"=== {prog}.java  [{preset}]  {NPROC} logical CPUs  {jv}")
+    unit = "bucket count" if prog == "HashTablePerformanceTest" else "point"
     print(f"=== Each point: {cfg['warmup']} warm-up runs (discarded), then median of "
-          f"{cfg['trials']} timed runs; timeout {cfg['timeout']}s per point")
+          f"{cfg['trials']} timed runs; timeout {cfg['timeout']}s per {unit}")
     compile_program(prog)
     rec = Recorder(prog, preset, cfg)
     print(f"[csv] appending to {rec.path.relative_to(HERE)} (run {rec.run_id})")
     {"SumThread": bench_sumthread, "ArraySum": bench_arraysum,
-     "ArraySum2": bench_arraysum2}[prog](rec, cfg, show)
+     "ArraySum2": bench_arraysum2, "HashTablePerformanceTest": bench_hashtable,
+     "AtomicMutexBenchmark": bench_mutex}[prog](rec, cfg, show)
     print(f"\n=== done in {time.monotonic() - t0:.1f}s")
 
 

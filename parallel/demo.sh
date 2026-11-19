@@ -6,6 +6,10 @@
 #   ./demo.sh ArraySum2.java     time vs size; vs cutoff; vs pool parallelism
 #   ./demo.sh all                overlay of every mode vs array size (from CSVs only)
 #
+#   ./demo.sh HashTablePerformanceTest.java   time vs buckets, one series per thread count
+#   ./demo.sh AtomicMutexBenchmark.java       time vs threads: spin vs spin+onSpinWait
+#   ./demo.sh ConcurrentHashTableTest.java    runs the tests with -ea; PASS/FAIL only
+#
 # Options:  --quick (default, < 45 s per program)   --full (publication figures)
 #           --no-show (don't open the PNGs)          --plot-only (re-plot from CSV)
 #
