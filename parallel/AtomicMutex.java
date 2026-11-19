@@ -7,7 +7,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class AtomicMutex {
     // State representation: 0 means unlocked, 1 means locked
     private final AtomicInteger state = new AtomicInteger(0);
-    public static final Boolean BACKOFF = false;
+    // Set with -Dmutex.backoff=true. A primitive boolean, since it is read in the spin loop.
+    public static boolean BACKOFF = Boolean.getBoolean("mutex.backoff");
 
     /**
      * Acquires the lock.
