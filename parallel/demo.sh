@@ -7,6 +7,8 @@
 #   ./demo.sh all                overlay of every mode vs array size (from CSVs only)
 #
 #   ./demo.sh HashTablePerformanceTest.java   time vs buckets, one series per thread count
+#   ./demo.sh HashTableLockBenchmark.java     time vs threads per lock placement (buckets fixed);
+#                                             1-thread control: time vs buckets
 #   ./demo.sh AtomicMutexBenchmark.java       time vs threads: spin vs spin+onSpinWait
 #   ./demo.sh ConcurrentHashTableTest.java    runs the tests with -ea; PASS/FAIL only
 #

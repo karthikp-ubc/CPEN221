@@ -3,7 +3,9 @@
 
 Every data point does `warmup` discarded runs, then `trials` timed runs, and
 reports the median (see each program's main()). Most programs use one fresh
-JVM per point; HashTablePerformanceTest uses one JVM per bucket count so the
+JVM per point (HashTableLockBenchmark: one per mode x thread count, and one per
+bucket count in its single-thread control sweep); HashTablePerformanceTest uses
+one JVM per bucket count so the
 table is built once and reused across thread counts. Rows are printed as they
 finish, appended to results/<Program>.csv, and plots are drawn from the CSV
 (latest run of each experiment).
@@ -25,7 +27,8 @@ HERE = Path(__file__).resolve().parent
 BUILD, RESULTS, FIGURES = HERE / "build", HERE / "results", HERE / "figures"
 NPROC = os.cpu_count() or 1
 FORKJOIN = ["SumThread", "ArraySum", "ArraySum2"]          # the `all` overlay
-BENCHMARKS = FORKJOIN + ["HashTablePerformanceTest", "AtomicMutexBenchmark"]
+BENCHMARKS = FORKJOIN + ["HashTablePerformanceTest", "HashTableLockBenchmark",
+                         "AtomicMutexBenchmark"]
 TESTS = ["ConcurrentHashTableTest"]                        # pass/fail only, run with -ea
 PROGRAMS = BENCHMARKS + TESTS
 DEPS = {  # extra sources compiled alongside a program, into its own build dir
@@ -58,6 +61,10 @@ PRESETS = {
             warmup=1, trials=5, timeout=60,    # sleep-bound: JIT warm-up barely matters
             threads=[1, 2, 4, 8, 16, 32], iterations=6,
         ),
+        HashTableLockBenchmark=dict(           # buckets held fixed for the thread sweep
+            timeout=60, buckets=1024, keys=4096, ops=200_000,
+            threads=[1, 2, 4, 8, 16], bucket_sweep=[1, 2, 4, 16, 64, 256, 1024],
+        ),
     ),
     "full": dict(
         warmup=5, trials=15, timeout=300,
@@ -79,6 +86,11 @@ PRESETS = {
             warmup=2, trials=9, timeout=1200,  # 64 threads x 100 iterations ~ 40 s per run
             threads=[1, 2, 4, 8, 16, 32, 64], iterations=100,
         ),
+        HashTableLockBenchmark=dict(
+            timeout=300, buckets=1024, keys=4096, ops=1_000_000,
+            threads=[1, 2, 4, 8, 16, 32, 64],
+            bucket_sweep=[1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096],
+        ),
     ),
 }
 
@@ -89,8 +101,8 @@ def cfg_for(prog, preset):
     return cfg
 
 
-# n is the problem size: array length (fork-join), table entries (hashtable),
-# or lock acquisitions per thread (mutex).
+# n is the problem size: array length (fork-join), table entries / key space
+# (hashtables), or lock acquisitions per thread (mutex).
 FIELDS = ["run_id", "timestamp", "preset", "experiment", "mode", "n", "threads",
           "cutoff", "parallelism", "buckets", "warmup", "trials", "median_ms", "status",
           "note"]
@@ -401,6 +413,59 @@ def bench_hashtable(rec, cfg, show):
     plot_program("HashTablePerformanceTest", cfg, show)
 
 
+HT_MODES = ["coarse", "fine", "counted-locked", "counted-atomic", "counted-unsafe"]
+
+
+def bench_hashtable_locks(rec, cfg, show):
+    """HashTableLockBenchmark: where `synchronized` sits, with the bucket count fixed."""
+    b, keys, ops, to = cfg["buckets"], cfg["keys"], cfg["ops"], cfg["timeout"]
+    w, t = cfg["warmup"], cfg["trials"]
+    note = f"ops/thread={ops}"
+    drift_re = r"worst drift ([+-]?\d+)"
+
+    def point(mode, buckets, k):
+        status, out, why = run_java("HashTableLockBenchmark", [mode, buckets, keys, ops, k, t, w], to)
+        med = grab(r"Median duration \(ms\) = ([\d.Ee+-]+)", out)
+        if status == "wrong":
+            d = re.search(drift_re, out)
+            why = f"count drift {d.group(1)}" if d else "a pre-loaded key went missing"
+            if mode == "counted-unsafe":
+                why += ", expected: unsynchronized counter"
+        elif status != "ok":
+            med = None
+        return status, med, why
+
+    # (a) time vs threads, buckets fixed: the figure that replaces slide 30's table
+    tab = Table(f"HashTableLockBenchmark (a): time vs threads, {b} buckets fixed, {si(keys)} keys, "
+                f"{si(ops)} ops/thread (~12% writes)  (nproc = {NPROC})",
+                [("threads", 7), ("mode", 14), ("median ms", 10), ("time / 1T", 9), ("", 0)])
+    base = {}
+    for k in cfg["threads"]:
+        for mode in HT_MODES:  # interleaved so drift hits every mode equally
+            tab.start(k, mode)
+            status, med, why = point(mode, b, k)
+            if k == 1 and med:
+                base[mode] = med
+            ratio = f"{med / base[mode]:.2f}x" if (med and mode in base) else ""
+            tab.finish(ms(med), ratio, status_cell(status, why))
+            # counted-unsafe's "wrong" rows keep their time: fast-but-wrong is the result
+            rec.add("threads", mode, med, status, f"{note}; {why}" if why else note,
+                    n=keys, threads=k, buckets=b)
+    plot_program("HashTableLockBenchmark", cfg, show, only="threads")
+
+    # (b) control: one thread, so no lock can contend; only chain length changes
+    tab = Table(f"HashTableLockBenchmark (b): control, 1 thread (no contention possible), "
+                f"mode fine, {si(keys)} keys, time vs buckets",
+                [("buckets", 7), ("chain len", 9), ("median ms", 10), ("", 0)])
+    for nb in cfg["bucket_sweep"]:
+        tab.start(nb, f"{keys / nb:g}")
+        status, med, why = point("fine", nb, 1)
+        tab.finish(ms(med), status_cell(status, why))
+        rec.add("buckets", "fine", med, status, f"{note}; {why}" if why else note,
+                n=keys, threads=1, buckets=nb)
+    plot_program("HashTableLockBenchmark", cfg, show, only="buckets")
+
+
 def expected_sleep(iters, k):
     """Expected time if locking cost nothing: each thread sleeps U{0..10} ms
     outside and inside the lock (mean 5 ms each), and the in-lock sleeps of all
@@ -446,7 +511,9 @@ def run_tests(prog):
 C = {"blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a",
      "yellow": "#eda100", "magenta": "#e87ba4", "violet": "#6250d6"}
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
-STYLE = {  # mode -> (color, marker, label). Color follows the mode in every figure.
+# mode -> (color, marker, label). Colours are unique within one program's figures
+# (and the `all` overlay); programs never share a figure, so they reuse the palette.
+STYLE = {
     "sequential":       (C["blue"], "o", "Sequential"),
     "same-thread":      (C["orange"], "s", "Threads: right.run()"),
     "separate-threads": (C["aqua"], "^", "Threads: right.start()"),
@@ -454,6 +521,11 @@ STYLE = {  # mode -> (color, marker, label). Color follows the mode in every fig
     "SumThread":        (C["magenta"], "o", "SumThread (fixed split)"),
     "spin":             (C["blue"], "o", "spin"),
     "spin+onSpinWait":  (C["orange"], "s", "spin + Thread.onSpinWait()"),
+    "coarse":           (C["orange"], "s", "coarse: 1 table lock"),
+    "fine":             (C["blue"], "o", "fine: 1 lock per bucket"),
+    "counted-locked":   (C["violet"], "D", "fine + numElements under table lock"),
+    "counted-atomic":   (C["aqua"], "^", "fine + AtomicInteger numElements"),
+    "counted-unsafe":   (C["magenta"], "v", "fine + unsynchronized numElements"),
 }
 # Ordinal blue ramp (light -> dark) for "one series per thread count".
 RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab",
@@ -679,6 +751,60 @@ def plot_program(prog, cfg, show, only=None):
             footer(fig, rs, timeout_note(failed), jvm="table built once per bucket count")
             out.append(save(fig, "HashTablePerformanceTest_buckets", cfg, plt))
 
+    if prog == "HashTableLockBenchmark" and want("threads"):
+        rs = latest(rows, "threads")
+        if rs:
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            # counted-unsafe is drawn by hand: its "wrong" points have real times
+            failed = draw(ax, rs, [m for m in HT_MODES if m != "counted-unsafe"], "threads")
+            pts = sorted((int(r["threads"]), float(r["median_ms"]), r["status"]) for r in rs
+                         if r["mode"] == "counted-unsafe" and r["median_ms"])
+            if pts:
+                color, marker, label = STYLE["counted-unsafe"]
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linestyle="--",
+                        marker=marker, markeredgecolor="white", markeredgewidth=1.2,
+                        label=f"{label}  (✖ = count was wrong)")
+                bad = [p for p in pts if p[2] == "wrong"]
+                ax.plot([p[0] for p in bad], [p[1] for p in bad], color=color, marker="X",
+                        markersize=11, markeredgecolor="white", linestyle="none")
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            plain_log(ax.yaxis)
+            ks = sorted({int(r["threads"]) for r in rs})
+            ax.set_xticks(ks, [str(k) for k in ks])
+            ax.axvline(NPROC, color=INK2, linestyle="--", linewidth=1)
+            right = NPROC >= max(ks)  # keep the label inside the axes
+            ax.text(NPROC / 1.06 if right else NPROC * 1.06, 0.95, f"{NPROC} logical CPUs",
+                    transform=ax.get_xaxis_transform(), color=INK2, fontsize=9, va="top",
+                    ha="right" if right else "left")
+            ax.set_xlabel("number of threads")
+            ax.set_ylabel("median time (ms, log scale)")
+            ops = re.search(r"ops/thread=(\d+)", rs[0]["note"])
+            per = f", {si(ops.group(1))} ops/thread" if ops else ""
+            ax.set_title(f"Lock granularity: {rs[0]['buckets']} buckets fixed, "
+                         f"{si(rs[0]['n'])} keys{per}")
+            ax.legend(loc="upper left", fontsize=9)
+            footer(fig, rs, timeout_note(failed))
+            out.append(save(fig, "HashTableLockBenchmark_threads", cfg, plt))
+
+    if prog == "HashTableLockBenchmark" and want("buckets"):
+        rs = latest(rows, "buckets")
+        if rs:
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            failed = draw(ax, rs, ["fine"], "buckets")
+            ax.set_xscale("log", base=2); ax.set_yscale("log"); plain_log(ax.yaxis)
+            bs = sorted({int(r["buckets"]) for r in rs})
+            ax.set_xticks(bs, [str(b) for b in bs])
+            ax.set_xlabel("number of buckets (chain length = keys / buckets)")
+            ax.set_ylabel("median time (ms, log scale)")
+            ops = re.search(r"ops/thread=(\d+)", rs[0]["note"])
+            per = f", {si(ops.group(1))} ops" if ops else ""
+            ax.set_title(f"Control: 1 thread, so no lock contention -- "
+                         f"{si(rs[0]['n'])} keys{per}")
+            ax.legend(loc="upper right")
+            footer(fig, rs, timeout_note(failed))
+            out.append(save(fig, "HashTableLockBenchmark_buckets", cfg, plt))
+
     if prog == "AtomicMutexBenchmark" and want("threads"):
         rs = latest(rows, "threads")
         if rs:
@@ -799,6 +925,7 @@ def main():
     print(f"[csv] appending to {rec.path.relative_to(HERE)} (run {rec.run_id})")
     {"SumThread": bench_sumthread, "ArraySum": bench_arraysum,
      "ArraySum2": bench_arraysum2, "HashTablePerformanceTest": bench_hashtable,
+     "HashTableLockBenchmark": bench_hashtable_locks,
      "AtomicMutexBenchmark": bench_mutex}[prog](rec, cfg, show)
     print(f"\n=== done in {time.monotonic() - t0:.1f}s")
 
