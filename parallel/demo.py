@@ -783,7 +783,7 @@ def plot_program(prog, cfg, show, only=None):
             per = f", {si(ops.group(1))} ops/thread" if ops else ""
             ax.set_title(f"Lock granularity: {rs[0]['buckets']} buckets fixed, "
                          f"{si(rs[0]['n'])} keys{per}")
-            ax.legend(loc="upper left", fontsize=9)
+            ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)  # outside: lines fill the plot
             footer(fig, rs, timeout_note(failed))
             out.append(save(fig, "HashTableLockBenchmark_threads", cfg, plt))
 
